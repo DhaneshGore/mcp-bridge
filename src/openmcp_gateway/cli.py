@@ -53,10 +53,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
     for warning in config.warnings():
         _print_err(f"warning: {warning}")
 
+    _config_path = resolve_config_path(args.config)
     trusted = config.gateway.trusted_proxies
     server = uvicorn.Server(
         uvicorn.Config(
-            create_app(config),
+            create_app(config, config_path=_config_path),
             host=config.gateway.host,
             port=config.gateway.port,
             log_config=None,

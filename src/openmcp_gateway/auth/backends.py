@@ -53,10 +53,23 @@ class StaticTokenAuthenticator:
     """
 
     def __init__(self, config: AuthConfig) -> None:
-        self._by_hash = {
-            t.sha256: Principal(name=t.name, servers=frozenset(t.servers), roles=frozenset(t.roles))
+        self._by_hash = self._build(config)
+
+    @staticmethod
+    def _build(config: AuthConfig) -> dict[str, Principal]:
+        return {
+            t.sha256: Principal(
+                name=t.name,
+                servers=frozenset(t.servers),
+                roles=frozenset(t.roles),
+                tool_rules=tuple((r.pattern, r.action) for r in t.tool_rules),
+            )
             for t in config.tokens
         }
+
+    def reload(self, config: AuthConfig) -> None:
+        """Atomically update the token table (for config hot-reload)."""
+        self._by_hash = self._build(config)
 
     async def authenticate(self, conn: HTTPConnection) -> Principal | None:
         token = bearer_token(conn)
@@ -72,6 +85,27 @@ class NoAuthAuthenticator:
 
     async def authenticate(self, conn: HTTPConnection) -> Principal | None:
         return ANONYMOUS
+
+
+class OptionalTokenAuthenticator:
+    """Optional bearer token: anonymous when no token is presented; validated when one is."""
+
+    def __init__(self, config: AuthConfig) -> None:
+        self._by_hash = StaticTokenAuthenticator._build(config)
+
+    def reload(self, config: AuthConfig) -> None:
+        """Atomically update the token table (for config hot-reload)."""
+        self._by_hash = StaticTokenAuthenticator._build(config)
+
+    async def authenticate(self, conn: HTTPConnection) -> Principal | None:
+        token = bearer_token(conn)
+        if token is None:
+            return ANONYMOUS
+        if len(token) > 512:
+            return None
+        principal = self._by_hash.get(hash_token(token))
+        # Unknown token → reject (don't silently downgrade to anonymous)
+        return principal
 
 
 class GatewayUser(AuthenticatedUser):
@@ -116,5 +150,15 @@ class GatewayAuthBackend(AuthenticationBackend):
 
 def build_authenticators(config: AuthConfig) -> tuple[Authenticator, Authenticator]:
     tokens = StaticTokenAuthenticator(config)
-    mcp: Authenticator = tokens if config.mode == "bearer" else NoAuthAuthenticator()
+    if config.mode == "bearer":
+        mcp: Authenticator = tokens
+    elif config.mode == "optional":
+        mcp = OptionalTokenAuthenticator(config)
+    elif config.mode == "jwt":
+        from openmcp_gateway.auth.jwt_auth import build_jwt_authenticator
+
+        assert config.jwt is not None  # enforced by AuthConfig validator
+        mcp = build_jwt_authenticator(config.jwt)
+    else:
+        mcp = NoAuthAuthenticator()
     return mcp, tokens

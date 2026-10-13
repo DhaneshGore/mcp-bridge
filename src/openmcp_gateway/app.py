@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import sqlite3
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from fastapi import FastAPI
 from mcp.server.streamable_http_manager import StreamableHTTPASGIApp, StreamableHTTPSessionManager
@@ -16,6 +18,7 @@ from starlette.routing import Route
 from openmcp_gateway import PROJECT_SLUG, __version__
 from openmcp_gateway.api import admin, health, packages
 from openmcp_gateway.api.middleware import RequestIdMiddleware, RequirePrincipal
+from openmcp_gateway.audit import setup_audit_logger
 from openmcp_gateway.auth.backends import GatewayAuthBackend, build_authenticators
 from openmcp_gateway.config import ConfigError, GatewayConfig, RateLimitConfig
 from openmcp_gateway.downstream.server import build_mcp_server
@@ -85,7 +88,12 @@ def create_app(
     *,
     manager: ServerManager | None = None,
     repository: ServerRepository | None = None,
+    config_path: Path | None = None,
 ) -> FastAPI:
+    setup_audit_logger(config.admin)
+    from openmcp_gateway.observability.tracing import setup_tracing
+
+    setup_tracing(config.telemetry)
     manager = manager or ServerManager(config)
     repository = repository or build_repository(config)
     package_service: PackageService | None = None
@@ -105,6 +113,7 @@ def create_app(
         session_idle_timeout=config.limits.session_idle_timeout,
         max_sessions=config.limits.max_sessions,
     )
+    mcp_authn, admin_authn = build_authenticators(config.auth)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -112,29 +121,66 @@ def create_app(
             "gateway starting",
             extra={"version": __version__, "servers": len(config.servers), "auth_mode": config.auth.mode},
         )
+        _reload_task: asyncio.Task[None] | None = None
         try:
             async with session_manager.run():
                 await load_registered_servers(manager, repository)
                 await manager.start_autostart()
                 app.state.started = True
+                if config_path is not None:
+                    from openmcp_gateway.reload import ConfigReloader
+
+                    reloader = ConfigReloader(
+                        config_path, app, manager, (mcp_authn, admin_authn), metrics
+                    )
+                    _reload_task = asyncio.create_task(reloader.watch(), name="config-hot-reload")
                 yield
                 app.state.started = False
         finally:
+            if _reload_task is not None:
+                _reload_task.cancel()
             await manager.shutdown()
             await repository.close()
             if package_service is not None:
                 await package_service.close()
+            from openmcp_gateway.audit import get_audit_logger
+
+            get_audit_logger().close()
             logger.info("gateway stopped")
 
     app = FastAPI(
         title=config.gateway.name,
         version=__version__,
         lifespan=lifespan,
-        # Interactive docs pull assets from a CDN; the schema itself is enough.
-        docs_url=None,
-        redoc_url=None,
+        docs_url="/docs",
+        redoc_url="/redoc",
         openapi_url="/openapi.json",
+        openapi_tags=[],
     )
+
+    def custom_openapi() -> dict:
+        if app.openapi_schema:
+            return app.openapi_schema
+        from fastapi.openapi.utils import get_openapi
+        schema = get_openapi(
+            title=app.title,
+            version=app.version,
+            routes=app.routes,
+        )
+        schema.setdefault("components", {})
+        schema["components"]["securitySchemes"] = {
+            "BearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "opaque",
+                "description": "Gateway bearer token. Generate with `openmcp token generate`.",
+            }
+        }
+        schema["security"] = [{"BearerAuth": []}]
+        app.openapi_schema = schema
+        return schema
+
+    app.openapi = custom_openapi  # type: ignore[method-assign]
     app.state.config = config
     app.state.manager = manager
     app.state.service = service
@@ -142,12 +188,15 @@ def create_app(
     app.state.started = False
 
     app.include_router(health.router)
+    if config.auth.mode == "jwt" or config.auth.oauth is not None:
+        from openmcp_gateway.api.wellknown import build_wellknown_router
+
+        app.include_router(build_wellknown_router(config))
     if config.admin.enabled:
         app.include_router(admin.build_router(manager, repository, config))
         if package_service is not None:
             app.include_router(packages.build_packages_router(package_service, manager, repository))
 
-    mcp_authn, admin_authn = build_authenticators(config.auth)
     app.router.routes.append(
         Route(
             config.gateway.mcp_path,

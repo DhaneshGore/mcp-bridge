@@ -84,6 +84,11 @@ class GatewayMetrics:
             buckets=_LATENCY_BUCKETS,
             registry=self.registry,
         )
+        self.config_reloads = Counter(
+            "openmcp_config_reloads_total",
+            "Number of successful configuration hot-reloads.",
+            registry=self.registry,
+        )
         self.registry.register(_RuntimeCollector(manager))
 
     def observe_mcp(self, method: str, exc: BaseException | None, seconds: float) -> None:

@@ -73,9 +73,11 @@ The tables below are generated from the code
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `mode` | `Literal['none', 'bearer']` | `"none"` | none: anonymous MCP access; bearer: tokens. |
-| `allow_unauthenticated_non_loopback` | `bool` | `False` | Permit mode=none on a non-loopback bind. Dangerous; for trusted networks only. |
+| `mode` | `Literal['none', 'bearer', 'optional', 'jwt']` | `"none"` | none: anonymous MCP access; bearer: static token required; optional: static token validated when provided, anonymous otherwise; jwt: OIDC/JWT bearer token required. |
+| `allow_unauthenticated_non_loopback` | `bool` | `False` | Permit mode=none/optional on a non-loopback bind. Dangerous; for trusted networks only. |
 | `tokens` | `list[TokenConfig]` | `[]` | Client and admin tokens (see auth.tokens[]). |
+| `jwt` | `JWTConfig \| None` | `None` | JWT/OIDC validation config. Required when mode=jwt. |
+| `oauth` | `OAuthConfig \| None` | `None` | OAuth 2.1 protected resource metadata. Enables /.well-known/oauth-protected-resource. |
 
 ### `auth.tokens[]`
 
@@ -85,6 +87,7 @@ The tables below are generated from the code
 | `sha256` | `str` | **required** | Hex SHA-256 of the token. Generate with `openmcp token generate`. |
 | `servers` | `list[str]` | `['*']` | Server ids, or '*' for all. |
 | `roles` | `list[Literal['admin', 'metrics']]` | `[]` | admin: full admin API; metrics: read /admin/metrics only. |
+| `tool_rules` | `list[ToolRule]` | `[]` | Ordered allow/deny rules for qualified tool names (e.g. 'github__*'). First matching rule wins; default is allow when no rules match. |
 
 ### `admin`
 
@@ -92,6 +95,7 @@ The tables below are generated from the code
 | --- | --- | --- | --- |
 | `enabled` | `bool` | `True` | Mount the /admin API (still requires an admin token). |
 | `allow_stdio_registration` | `bool` | `False` | Allow registering stdio servers via the admin API (equivalent to code execution). |
+| `audit_log_path` | `Path \| None` | `None` | Path to a JSON Lines audit log file. Each admin action is appended as one JSON object. Disabled when None (default). |
 
 ### `limits`
 

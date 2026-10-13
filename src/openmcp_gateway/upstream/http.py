@@ -128,6 +128,10 @@ class HttpUpstream:
     async def start(self) -> None:
         cfg = self.config
         headers = build_headers(cfg, self._host_env)
+        # Propagate W3C trace context to the upstream (no-op when OTel is not configured).
+        from opentelemetry.propagate import inject
+
+        inject(headers)
         policy = EgressPolicy(
             allow_private=cfg.allow_private_network or self._policy.allow_private,
             allowed_networks=self._policy.allowed_networks,

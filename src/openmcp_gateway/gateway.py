@@ -16,6 +16,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
+from opentelemetry import trace
+from opentelemetry.trace import StatusCode
+
 import mcp_types as types
 from pydantic import ValidationError
 
@@ -75,18 +78,25 @@ class GatewayService:
     # Each public operation is rate-limited and observed in one place.
 
     async def _run(self, method: str, principal: Principal, op: Callable[[], Awaitable[T]]) -> T:
-        started = time.perf_counter()
-        error: BaseException | None = None
-        try:
-            if self._rate_limiter is not None:
-                self._rate_limiter.check(principal.name)
-            return await op()
-        except BaseException as exc:
-            error = exc
-            raise
-        finally:
-            if self._observer is not None:
-                self._observer(method, error, time.perf_counter() - started)
+        tracer = trace.get_tracer("openmcp_gateway")
+        with tracer.start_as_current_span(
+            f"mcp.{method}",
+            attributes={"mcp.method": method, "mcp.principal": principal.name},
+        ) as span:
+            started = time.perf_counter()
+            error: BaseException | None = None
+            try:
+                if self._rate_limiter is not None:
+                    self._rate_limiter.check(principal.name)
+                return await op()
+            except BaseException as exc:
+                error = exc
+                span.set_status(StatusCode.ERROR)
+                span.record_exception(exc)
+                raise
+            finally:
+                if self._observer is not None:
+                    self._observer(method, error, time.perf_counter() - started)
 
     async def list_tools(self, principal: Principal) -> list[types.Tool]:
         return await self._run("tools/list", principal, lambda: self._list_tools(principal))
@@ -165,6 +175,8 @@ class GatewayService:
                 if not tool_allowed(server.config, tool.name):
                     continue
                 name = qualify(server.id, tool.name)
+                if not principal.can_use_tool(name):
+                    continue
                 if len(name) > MAX_RECOMMENDED_TOOL_NAME:
                     logger.warning("namespaced tool name exceeds 128 characters", extra={"tool": name})
                 tools.append(
@@ -189,6 +201,8 @@ class GatewayService:
         server = self.manager.get(server_id)
         assert server is not None
         if not tool_allowed(server.config, tool_name):
+            raise UnknownToolError(f"unknown tool: {name}")
+        if not principal.can_use_tool(name):
             raise UnknownToolError(f"unknown tool: {name}")
 
         params: dict[str, Any] = {"name": tool_name, "arguments": arguments or {}}

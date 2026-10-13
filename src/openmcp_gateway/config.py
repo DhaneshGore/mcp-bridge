@@ -306,7 +306,7 @@ class HttpConfig(_Strict):
     @field_validator("mcp_path")
     @classmethod
     def _check_mcp_path(cls, v: str) -> str:
-        reserved = ("/admin", "/health", "/ready", "/version", "/openapi.json")
+        reserved = ("/admin", "/health", "/ready", "/version", "/openapi.json", "/.well-known")
         if v == "/" or any(v == r or v.startswith(r + "/") for r in reserved):
             raise ValueError(f"mcp_path must not be '/' or overlap the built-in routes {', '.join(reserved)}")
         return v
@@ -338,12 +338,33 @@ class LimitsConfig(_Strict):
     )
 
 
+class ToolRule(_Strict):
+    """Glob-based allow/deny rule applied to a fully-qualified tool name (e.g. ``github__*``)."""
+
+    pattern: str = Field(description="fnmatch glob matched against the qualified tool name.")
+    action: Literal["allow", "deny"] = Field(description="What to do when the pattern matches.")
+
+    @field_validator("pattern")
+    @classmethod
+    def _check_pattern(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("tool rule pattern must not be empty")
+        return v
+
+
 class TokenConfig(_Strict):
     name: str = Field(description="Principal name, used in logs and session binding.")
     sha256: str = Field(description="Hex SHA-256 of the token. Generate with `openmcp token generate`.")
     servers: list[str] = Field(default_factory=lambda: ["*"], description="Server ids, or '*' for all.")
     roles: list[Literal["admin", "metrics"]] = Field(
         default_factory=list, description="admin: full admin API; metrics: read /admin/metrics only."
+    )
+    tool_rules: list[ToolRule] = Field(
+        default_factory=list,
+        description=(
+            "Ordered allow/deny rules for qualified tool names (e.g. 'github__*'). "
+            "First matching rule wins; default is allow when no rules match."
+        ),
     )
 
     @field_validator("name")
@@ -362,13 +383,84 @@ class TokenConfig(_Strict):
         return v
 
 
+class JWTConfig(_Strict):
+    """Configuration for JWT/OIDC bearer-token validation (auth.mode: jwt)."""
+
+    jwks_url: str | None = Field(
+        None,
+        description="URL of the JWKS endpoint (mutually exclusive with inline_jwks).",
+    )
+    inline_jwks: dict[str, Any] | None = Field(
+        None,
+        description="Literal JWKS object (for air-gapped deployments or tests).",
+    )
+    issuer: str | None = Field(None, description="Expected value of the 'iss' claim; None skips the check.")
+    audience: str | None = Field(None, description="Expected value of the 'aud' claim; None skips the check.")
+    algorithms: list[str] = Field(
+        default_factory=lambda: ["RS256", "ES256"],
+        description="Allowed signing algorithms.",
+    )
+    principal_claim: str = Field("sub", description="JWT claim used as the Principal name.")
+    roles_claim: str | None = Field(
+        None,
+        description="JWT claim containing a list of role strings (mapped to Principal.roles).",
+    )
+    jwks_refresh_interval: float = Field(
+        3600.0,
+        gt=0,
+        description="Seconds between background JWKS refreshes.",
+    )
+
+    @model_validator(mode="after")
+    def _check_jwks_source(self) -> JWTConfig:
+        if self.jwks_url is None and self.inline_jwks is None:
+            raise ValueError("jwt config requires either jwks_url or inline_jwks")
+        if self.jwks_url is not None and self.inline_jwks is not None:
+            raise ValueError("jwt config accepts jwks_url or inline_jwks, not both")
+        return self
+
+
+class OAuthConfig(_Strict):
+    """Metadata for RFC 8707 OAuth 2.1 Protected Resource discovery."""
+
+    authorization_server_url: str | None = Field(
+        None,
+        description="URL of the authorization server (included in the well-known metadata).",
+    )
+    resource: str | None = Field(
+        None,
+        description=(
+            "Resource identifier URI. Defaults to the gateway's own base URL when None."
+        ),
+    )
+    scopes_supported: list[str] = Field(
+        default_factory=list,
+        description="Scopes advertised in the well-known metadata.",
+    )
+
+
 class AuthConfig(_Strict):
-    mode: Literal["none", "bearer"] = Field("none", description="none: anonymous MCP access; bearer: tokens.")
+    mode: Literal["none", "bearer", "optional", "jwt"] = Field(
+        "none",
+        description=(
+            "none: anonymous MCP access; bearer: static token required; "
+            "optional: static token validated when provided, anonymous otherwise; "
+            "jwt: OIDC/JWT bearer token required."
+        ),
+    )
     allow_unauthenticated_non_loopback: bool = Field(
-        False, description="Permit mode=none on a non-loopback bind. Dangerous; for trusted networks only."
+        False, description="Permit mode=none/optional on a non-loopback bind. Dangerous; for trusted networks only."
     )
     tokens: list[TokenConfig] = Field(
         default_factory=list, description="Client and admin tokens (see auth.tokens[])."
+    )
+    jwt: JWTConfig | None = Field(
+        None,
+        description="JWT/OIDC validation config. Required when mode=jwt.",
+    )
+    oauth: OAuthConfig | None = Field(
+        None,
+        description="OAuth 2.1 protected resource metadata. Enables /.well-known/oauth-protected-resource.",
     )
 
     @model_validator(mode="after")
@@ -381,6 +473,8 @@ class AuthConfig(_Strict):
             raise ValueError("token hashes must be unique")
         if self.mode == "bearer" and not self.tokens:
             raise ValueError("auth.mode=bearer requires at least one token")
+        if self.mode == "jwt" and self.jwt is None:
+            raise ValueError("auth.mode=jwt requires an auth.jwt configuration block")
         return self
 
 
@@ -601,6 +695,32 @@ class AdminConfig(_Strict):
         False,
         description="Allow registering stdio servers via the admin API (equivalent to code execution).",
     )
+    audit_log_path: Path | None = Field(
+        None,
+        description=(
+            "Path to a JSON Lines audit log file. Each admin action is appended as one JSON object. "
+            "Disabled when None (default)."
+        ),
+    )
+
+
+class TelemetryConfig(_Strict):
+    """Optional OpenTelemetry tracing configuration."""
+
+    otel_endpoint: str | None = Field(
+        None,
+        description=(
+            "OTLP HTTP endpoint for span export (e.g. http://otel-collector:4318). "
+            "Tracing is disabled when None (default)."
+        ),
+    )
+    service_name: str = Field("openmcp-gateway", description="Service name reported in traces.")
+    sample_rate: float = Field(
+        1.0,
+        ge=0.0,
+        le=1.0,
+        description="Fraction of traces to sample (1.0 = all, 0.0 = none).",
+    )
 
 
 class GatewayConfig(BaseSettings):
@@ -624,6 +744,7 @@ class GatewayConfig(BaseSettings):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     packages: PackagesConfig = Field(default_factory=PackagesConfig)
+    telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     servers: list[ServerConfig] = Field(default_factory=list)
 
     @classmethod
@@ -647,7 +768,7 @@ class GatewayConfig(BaseSettings):
         if dupes:
             raise ValueError(f"duplicate server ids: {', '.join(dupes)}")
         if (
-            self.auth.mode == "none"
+            self.auth.mode in ("none", "optional")
             and not self.gateway.is_loopback()
             and not self.auth.allow_unauthenticated_non_loopback
         ):
@@ -668,7 +789,7 @@ class GatewayConfig(BaseSettings):
             for sid in tok.servers:
                 if sid != "*" and sid not in known:
                     out.append(f"token {tok.name!r} references unknown server {sid!r}")
-        if self.auth.mode == "none" and self.auth.allow_unauthenticated_non_loopback:
+        if self.auth.mode in ("none", "optional") and self.auth.allow_unauthenticated_non_loopback:
             out.append("authentication is disabled on a non-loopback address")
         if self.auth.mode == "none" and self.auth.tokens:
             out.append(
